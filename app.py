@@ -12,129 +12,177 @@ So calculated stats are stored as a csv, a data validation check is run to check
 are from the most up to data csv (based on whether matches are equal).
 """
 
-# Import packages
+# ----------- Import packages -----------
 import os
 import pandas as pd
-from flask import Flask, redirect, render_template, request, url_for, send_file
-from dash import dash, dcc, dash_table, Input, Output, State
+from flask import Flask, redirect, render_template, request, url_for, send_file, jsonify
+# import matplotlib.pyplot as plt
+import io
+import base64
+import json
+# for development using styles.css
+from datetime import datetime
 
-# Import files
-from dash_app_files import dash_functions, layout
+# ----------- Import files -----------
+import functions
+import display
 import raw_data_processing
+import data_visualisations
 import config
+from error_classes import MissingFileError, JsonLoadError, EmptyFileError, DataProcessingError
 
 app = Flask(__name__)
 app.secret_key = "abc"
 
-# File paths
+# ----------- Global variable -----------
+initialised = False
+player_stats_df = pd.DataFrame()
+player_form_dict = {}
+player_keys_dict = {}
+initialisation_errors = []
+
+# ----------- File paths -----------
 MATCH_DATA_PATH = config.MATCH_DATA_PATH
 PLAYER_KEYS_PATH = config.PLAYER_KEYS_PATH
 MATCH_COUNT_PATH = config.MATCH_COUNT_PATH
 PLAYER_STATS_PATH = config.PLAYER_STATS_PATH
+PLAYER_FORM_DICT_PATH = config.PLAYER_FORM_DICT_PATH
 
-dash_app = dash.Dash(__name__, server=app, url_base_pathname='/')
 
-dash_app.layout = layout.create_dashboard_tabs()
+# ----------- Routes -----------
+with app.app_context():
+    try:
+        if not initialised:
+            try:
+                file_statuses = {
+                    "match_data": functions.csv_file_checker(MATCH_DATA_PATH),
+                    "player_keys": functions.csv_file_checker(PLAYER_KEYS_PATH),
+                    "player_stats": functions.csv_file_checker(PLAYER_STATS_PATH),
+                    "player_form_dict": functions.json_file_checker(PLAYER_FORM_DICT_PATH)
+                }
+            except MissingFileError as e:
+                initialisation_errors.append(str(e))
 
-# Routes
+            if file_statuses['player_stats']['has_data'] and file_statuses['player_form_dict']['has_data']:
+                try:
+                    player_stats_df = pd.read_csv(PLAYER_STATS_PATH)
+                    with open(PLAYER_FORM_DICT_PATH, 'r') as file:
+                        player_form_dict = json.load(file)
+
+                    if isinstance(player_stats_df, pd.DataFrame) and player_stats_df.empty:
+                        if file_statuses['match_data']['has_data'] and file_statuses['player_keys']['has_data']:
+                            try:
+                                player_stats_df, player_form_dict = raw_data_processing.cs_player_stats_player_form(MATCH_DATA_PATH, MATCH_COUNT_PATH, PLAYER_KEYS_PATH, PLAYER_STATS_PATH, PLAYER_FORM_DICT_PATH)
+                            except DataProcessingError as e:
+                                initialisation_errors.append(str(e))
+                        else:
+                            initialisation_errors.append("match_data or player_keys file is empty")
+                
+                except (pd.errors.EmptyDataError, FileNotFoundError) as e:
+                    initialisation_errors.append(f"Error loading player_stats or player_form files: {e}")
+                    
+    except Exception as e:
+        initialisation_errors.append(f"Unexpected error initializing app: {e}")
+
 
 @app.route('/')
-def index():
-    return redirect(url_for('stats'))
+def home():
+    return render_template('home.html', timestamp=datetime.now().timestamp(), errors=initialisation_errors)
+
 
 @app.route('/stats')
 def stats():
-    if not os.path.exists(PLAYER_STATS_PATH):
-        return redirect(url_for('upload_data'))
-    
-    player_stats_df = pd.read_csv(PLAYER_STATS_PATH)
-    return layout.stats_tab_layout(player_stats_df)
+    global player_stats_df, player_keys_dict
 
-@app.route('/recalculate-stats', methods=['POST'])
-def recalculate_stats():
-    # Process raw match_data
-    player_records = raw_data_processing.process_match_data(MATCH_DATA_PATH, MATCH_COUNT_PATH)
-    
-    # Calculate player stats
-    calculated_player_stats = raw_data_processing.calculate_player_stats(player_records)
-    
-    # Create data frame from player stats
-    player_stats_df = raw_data_processing.create_player_stats_df(calculated_player_stats, PLAYER_KEYS_PATH)
-    
-    # Save player stats dataframe
-    raw_data_processing.save_player_stats_df(player_stats_df, PLAYER_STATS_PATH)
+    if os.path.exists(PLAYER_KEYS_PATH):
+        player_keys_df = pd.read_csv(PLAYER_KEYS_PATH)
+        player_keys_dict = player_keys_df.set_index('player_id')['player_name'].to_dict()
 
+    if player_stats_df.empty:
+        response = display.response("error", "Player stats could not be loaded or created. Please ensure the required files are uploaded and try again.")  
+        return render_template('stats.html', player_keys_dict=player_keys_dict, response=response)
+
+    # Generate example Form heatmap graph
+    default_player_ids = list(player_form_dict.keys())[:4]
+    form_window = 10
+    plotly_heatmap = data_visualisations.form_heatmap(default_player_ids, form_window, player_form_dict, player_keys_dict)
+    
+    # Generate goal difference scatter plot
+    plotly_scatter = data_visualisations.goal_diff_scatter_plot(player_stats_df)
+    
+    # Generate W/D/L stacked bar chat
+    plotly_bargraph = data_visualisations.results_bar_graph(player_stats_df)
+
+    response = display.response("success", "Great success", player_stats_df.to_dict())  
+    return render_template('stats.html', 
+                        player_keys_dict=player_keys_dict,
+                        player_stats_df=player_stats_df,
+                        plotly_heatmap=plotly_heatmap, 
+                        plotly_scatter=plotly_scatter, 
+                        plotly_bargraph=plotly_bargraph, 
+                        response=response)
+
+
+@app.route('/generate_form_heatmap', methods=['POST'])
+def generate_form_heatmap():
+    global player_form_dict, player_keys_dict
+
+    player_ids = request.form.getlist('player_ids')
+    form_window = int(request.form['form_window'])
+
+    form_heatmap = data_visualisations.form_heatmap(player_ids, form_window, player_form_dict, player_keys_dict)
+
+    return jsonify({"status": "success", "form_heatmap_json": form_heatmap})    
+
+
+@app.route('/stats/recalculate')
+def recalculate_player_stats():
+    global player_stats_df, player_form_dict
+    player_stats_df, player_form_dict = raw_data_processing.cs_player_stats_player_form(MATCH_DATA_PATH, MATCH_COUNT_PATH, PLAYER_KEYS_PATH, PLAYER_STATS_PATH, PLAYER_FORM_DICT_PATH)
     return redirect(url_for('stats'))
 
-@app.route('/download-stats')
-def download_stats():
-    if os.path.exists(PLAYER_STATS_PATH):
-        return send_file(PLAYER_STATS_PATH, as_attachment=True)
-    else:
-        return "Stats file not found.", 404
 
-@app.route('/upload_data')
-def upload_data():
-    return layout.upload_tab_layout
+@app.route('/upload')
+def upload():
+    return render_template('upload.html')
 
-# Callbacks
+@app.route('/predictions')
+def predictions():
+    return render_template('predictions.html')
 
-@dash_app.callback(
-        Output('tabs-content', 'children'),
-        Input('tabs', 'value')
-)
-def render_tab_content(selected_tab):
-    if selected_tab == 'stats':
-        return stats()
-    elif selected_tab == 'match_prediction':
-        return #prediction tab layout
-    elif selected_tab == 'upload_data':
-        return upload_data()
-
-@dash_app.callback(
-    Output('validation-alert', 'is_open'),
-    Output('validation-alert', 'children'),
-    Output('validation-alert', 'color'),
-    Input('app-load-trigger', 'data'),
-    Input('match-data-path', 'data'),
-    Input('match-count-path', 'data')
-)
-def validate_data_on_app_initialisation(data_trigger, match_data_path, match_count_path):
-    return dash_functions.app_initialisation_validate_data_check(data_trigger, match_data_path, match_count_path)
-
-@dash_app.callback(
-    Output('upload-status-match', 'children'),
-    Input('upload-match', 'contents'),
-    State('upload-match', 'filename')
-)
-def upload_match_data(contents, filename):
-    if contents is None:
-        return "No file uploaded."
-    return dash_functions.handle_match_data_upload(filename, contents)
+@app.route('/upload_file', methods=['POST'])
+def upload_file():
+    try:
+        if 'file' not in request.files:
+            return display.response("error", "file upload error")
         
-@dash_app.callback(
-    Output('upload-status-players', 'children'),
-    Input('upload-players', 'contents'),
-    State('upload-players', 'filename')
-)
-def upload_player_keys(contents, filename):
-    if contents is None:
-        return "No file uploaded."
-    return dash_functions.handle_player_keys_upload(filename, contents)
+        file = request.files['file']
+        file_type = request.form.get('file_type')
+
+        upload_result = functions.upload(file, file_type, MATCH_DATA_PATH, PLAYER_KEYS_PATH)
+
+        return render_template('upload.html', response=upload_result)
+    
+    except Exception as e:
+        error_message = f"An error occurred during file upload: {str(e)}"
+        return render_template('upload.html', response=display.reponse("error", error_message))
 
 context = config.SSL_CONTEXT
 
 if __name__ == '__main__':
     app.run(debug=True, host='127.0.0.1', port=5000, ssl_context = context)
+    
 
 
-## 31DEC24 SLS: Next step is to double-check that the tabs are coded how i imagine, e.g. not re-processing everytime etc. 
-# 1. Move ml_data_set and player key files over
 
-# 3. Push to Git
-# 4. Trial run the app
-# 5. Fix any bugs with the app
-# 6. Improve the HTML files of the app
-# 7. Further improve the stats functionality via duo, trio, quad stats.
-# 8. Implement the display of extra stats (duos/trios etc, form, nemesis higlighter?)
-# 9. Once fully functional, and operational try implement a prediction tab. 
+
+
+
+
+# 25FEB25
+# 1. Fix re-calculate display and double check functionality (it should be above/next to player stats)
+# 2. Make upload button style match stats
+# 3. Add some filler content on home page
+# 4. Upload to git
+# 5. Comb through code to clean it up and remove unecessary files
+# 6. Explore predition functionality
